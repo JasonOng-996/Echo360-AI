@@ -10,10 +10,15 @@ import re
 import struct
 import tempfile
 import threading
+import time
 
 
 class TaskStopped(BaseException):
     """A user stop must not be swallowed by a normal download retry."""
+
+
+class TaskPaused(BaseException):
+    """An uncertain API failure ends the batch without an automatic resubmit."""
 
 
 class TaskControl:
@@ -22,6 +27,33 @@ class TaskControl:
         self.input_handler = input_handler
         self.progress_handler = progress_handler
         self.request_handler = request_handler
+        self._state_lock = threading.Lock()
+        self._api_request = None
+        self._sync_work = 0
+
+    def begin_api_request(self, label, timeout):
+        self.check()
+        with self._state_lock:
+            self._api_request = {"label": label, "timeout": timeout, "started": time.monotonic()}
+
+    def finish_api_request(self):
+        with self._state_lock:
+            self._api_request = None
+
+    def api_request_state(self):
+        with self._state_lock:
+            return dict(self._api_request) if self._api_request else None
+
+    async def run_sync(self, operation, *args):
+        """Keep the async owner alive until an analysis thread has saved its result."""
+        self.check()
+        with self._state_lock:
+            self._sync_work += 1
+        try:
+            return await asyncio.to_thread(operation, *args)
+        finally:
+            with self._state_lock:
+                self._sync_work -= 1
 
     def check(self):
         if self.stopped.is_set():
@@ -54,7 +86,9 @@ class TaskControl:
         task = asyncio.create_task(coroutine)
         try:
             while not task.done():
-                if self.stopped.is_set():
+                with self._state_lock:
+                    saving_in_thread = self._sync_work > 0
+                if self.stopped.is_set() and not saving_in_thread:
                     task.cancel()
                     await asyncio.gather(task, return_exceptions=True)
                     raise TaskStopped("Task stopped by user")

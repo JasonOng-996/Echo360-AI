@@ -9,17 +9,18 @@ import queue
 import sys
 import subprocess
 import threading
+import time
 import traceback
 import webbrowser
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 import uq_echo_ai as engine
-from runtime_support import TaskControl, TaskStopped, redact, atomic_text
+from runtime_support import TaskControl, TaskStopped, TaskPaused, redact, atomic_text
 from notes_view import scan_notes, choose_note, configure_reader, render_markdown, note_label
 
 APP_TITLE = "EchoLecture AI"
-APP_VERSION = "2.2.1"
+APP_VERSION = "2.2.2"
 
 
 class QueueWriter:
@@ -154,10 +155,11 @@ class EchoLectureApp(tk.Tk):
         field(ai, 6, "最小帧间隔（秒）", "video_min_frame_gap_sec")
         field(ai, 7, "画面扫描间隔（秒）", "video_scene_scan_interval_sec")
         field(ai, 8, "覆盖间隔（秒）", "video_coverage_interval_sec")
+        field(ai, 9, "总结等待时间（秒）", "summary_timeout_sec")
         ttk.Label(ai, text="模型 ID 可直接输入。请先测试当前账户是否能调用该模型。\nAPI 按服务商规则计费；分析会发送字幕和抽取的画面。",
-                  wraplength=410, justify="left").grid(row=9, column=0, columnspan=2, sticky="w", pady=(12, 0))
+                  wraplength=410, justify="left").grid(row=10, column=0, columnspan=2, sticky="w", pady=(12, 0))
         ttk.Label(ai, text="默认保留旧版已有分析，不因模型、抽帧参数或缓存变化重做。取消“仅补缺失文件”后，缓存不匹配的内容可能重新调用 API。",
-                  wraplength=410).grid(row=10, column=0, columnspan=2, sticky="w", pady=(12, 0))
+                  wraplength=410).grid(row=11, column=0, columnspan=2, sticky="w", pady=(12, 0))
 
         actions = ttk.Frame(left, padding=(0, 10, 0, 0))
         actions.grid(row=1, column=0, sticky="ew")
@@ -172,9 +174,12 @@ class EchoLectureApp(tk.Tk):
         inspect_btn = ttk.Button(actions, text="检查缺失文件（不调用 API）", command=self.inspect_missing)
         inspect_btn.grid(row=2, column=0, columnspan=2, sticky="ew", padx=3, pady=3)
         self.settings_controls.append(inspect_btn)
-        ttk.Button(actions, text="查看登录 / 下载进度", command=lambda: self.right_tabs.select(self.task_page)).grid(row=3, column=0, sticky="ew", padx=3, pady=3)
+        single_btn = ttk.Button(actions, text="分析一个课堂文件夹…", command=self.analyze_one_folder)
+        single_btn.grid(row=3, column=0, columnspan=2, sticky="ew", padx=3, pady=3)
+        self.settings_controls.append(single_btn)
+        ttk.Button(actions, text="查看登录 / 下载进度", command=lambda: self.right_tabs.select(self.task_page)).grid(row=4, column=0, sticky="ew", padx=3, pady=3)
         self.stop_btn = ttk.Button(actions, text="停止任务", command=self.stop_task, state="disabled")
-        self.stop_btn.grid(row=3, column=1, sticky="ew", padx=3, pady=3)
+        self.stop_btn.grid(row=4, column=1, sticky="ew", padx=3, pady=3)
 
         right.columnconfigure(0, weight=1)
         right.rowconfigure(2, weight=1)
@@ -378,6 +383,7 @@ class EchoLectureApp(tk.Tk):
                     raise ValueError(f"{name} 必须至少为 {minimum}")
             for name, var in self.flags.items():
                 cfg[name] = var.get()
+            cfg["summary_timeout_sec"] = engine.summary_timeout(cfg)
             cfg["analyze_video_with_api"] = cfg["analyze_video"]
             if not cfg["output_root"]:
                 raise ValueError("请选择保存目录")
@@ -457,6 +463,8 @@ class EchoLectureApp(tk.Tk):
                         outcome = "有未完成项目，请查看日志；重新运行可继续处理"
             except (TaskStopped, asyncio.CancelledError):
                 outcome = "已停止；已完成结果已保留"
+            except TaskPaused as exc:
+                outcome = "已暂停；" + redact(str(exc))
             except Exception:
                 traceback.print_exc(file=writer)
                 outcome = "任务失败，请查看日志"
@@ -472,6 +480,19 @@ class EchoLectureApp(tk.Tk):
     def analyze_existing(self):
         self._run_worker("正在扫描已下载文件…", lambda cfg, ctl: engine.analyze_existing_lectures(cfg), uses_ai=True)
 
+    def analyze_one_folder(self):
+        if self.worker and self.worker.is_alive():
+            return
+        folder = filedialog.askdirectory(title="选择一节课的日期文件夹（含 transcript.vtt）",
+                                         initialdir=str(engine.expand_path(self.cfg.get("output_root", "."))))
+        if not folder:
+            return
+        path = Path(folder)
+        if not (path / "transcript.vtt").is_file():
+            self._report_error("请选择具体的课堂日期文件夹，例如 CSSE7023/2026-09-04；该目录应含 transcript.vtt。")
+            return
+        self._run_worker("正在分析所选课堂…", lambda cfg, ctl: engine.analyze_existing_lectures(cfg, path), uses_ai=True)
+
     def inspect_missing(self):
         self._run_worker("正在检查缺失文件（不调用 API）…", lambda cfg, ctl: engine.inspect_missing_files(cfg))
 
@@ -482,8 +503,15 @@ class EchoLectureApp(tk.Tk):
         if self.control:
             self.control.stop()
             self.stop_btn.configure(state="disabled")
-            self._clear_request("已停止等待确认。已生成的笔记仍可在“AI 总结”中阅读。")
-            self.status.set("正在停止…正在进行的 AI 请求结束后会退出，不再提交新批次。")
+            self._clear_request("已请求停止后续任务。当前请求若成功，将先保存结果；已有笔记可继续阅读。")
+            self.status.set("正在停止…等待当前操作结束，成功结果保存后退出。")
+
+    def _update_request_status(self):
+        state = self.control.api_request_state() if self.control else None
+        if state:
+            elapsed = max(0, int(time.monotonic() - state["started"]))
+            prefix = "停止中，成功后保存" if self.control.stopped.is_set() else "等待 AI"
+            self.status.set(f"{prefix} · {state['label']} · 已等待 {elapsed} 秒 / 读取超时 {state['timeout']:g} 秒")
 
     def _poll_events(self):
         try:
@@ -514,6 +542,7 @@ class EchoLectureApp(tk.Tk):
                     self.refresh_notes()
         except queue.Empty:
             pass
+        EchoLectureApp._update_request_status(self)
         self.after(100, self._poll_events)
 
     def _clear_request(self, message=""):

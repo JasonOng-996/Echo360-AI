@@ -20,7 +20,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional, Iterable
 
-from runtime_support import (TaskControl, TaskStopped, atomic_text, atomic_bytes,
+from runtime_support import (TaskControl, TaskStopped, TaskPaused, atomic_text, atomic_bytes,
     read_json, nonempty_text, valid_vtt, valid_mp4, fingerprint, cache_matches,
     save_cached, checked_ai_text, redact)
 
@@ -62,6 +62,7 @@ def load_config() -> dict:
     defaults = json.loads(DEFAULT_CONFIG_PATH.read_text(encoding="utf-8-sig"))
     # Keep the two-file hotfix compatible with the 2.1.0/2.1.1 defaults file.
     defaults.setdefault("only_missing", True)
+    defaults.setdefault("summary_timeout_sec", 600)
     if not CONFIG_PATH.exists():
         save_config(defaults)
         return defaults
@@ -150,7 +151,14 @@ def selected_api_key(config: dict) -> str:
     return keys.get("ANTHROPIC_API_KEY", "") or keys.get("ANTHROPIC_AUTH_TOKEN", "")
 
 
-def _client_from_env(config: dict, verbose: bool = False):
+def summary_timeout(config):
+    value = float(config.get("summary_timeout_sec", 600))
+    if not math.isfinite(value) or not 30 <= value <= 3600:
+        raise ValueError("总结等待时间必须为 30～3600 秒")
+    return value
+
+
+def _client_from_env(config: dict, verbose: bool = False, *, timeout=120.0):
     _, keys = load_local_env(verbose=verbose, config=config)
     provider = selected_provider(config)
     if provider == "openai":
@@ -158,7 +166,7 @@ def _client_from_env(config: dict, verbose: bool = False):
         if not api_key:
             return None
         from openai import OpenAI
-        return OpenAI(api_key=api_key, timeout=120.0, max_retries=2)
+        return OpenAI(api_key=api_key, timeout=timeout, max_retries=0)
 
     api_key = keys.get("ANTHROPIC_API_KEY", "")
     auth_token = keys.get("ANTHROPIC_AUTH_TOKEN", "")
@@ -174,17 +182,51 @@ def _client_from_env(config: dict, verbose: bool = False):
     # Official Anthropic API: ANTHROPIC_API_KEY. ANTHROPIC_AUTH_TOKEN is mainly for
     # compatible gateways/proxies and is only used when an API key is absent.
     if api_key:
-        kwargs = {"api_key": api_key, "timeout": 120.0, "max_retries": 2}
+        kwargs = {"api_key": api_key, "timeout": timeout, "max_retries": 0}
         if default_headers:
             kwargs["default_headers"] = default_headers
         return Anthropic(**kwargs)
     base_url = os.getenv("ANTHROPIC_BASE_URL", "").strip() or None
-    kwargs = {"auth_token": auth_token, "timeout": 120.0, "max_retries": 2}
+    kwargs = {"auth_token": auth_token, "timeout": timeout, "max_retries": 0}
     if default_headers:
         kwargs["default_headers"] = default_headers
     if base_url:
         kwargs["base_url"] = base_url
     return Anthropic(**kwargs)
+
+
+def request_ai(operation, *, label, timeout, input_chars, images=0):
+    """One SDK call only; uncertain failures must not proceed to another lecture."""
+    control = CONTROL
+    control.begin_api_request(label, timeout)
+    started = time.monotonic()
+    print(f"[API START] {datetime.now().isoformat(timespec='seconds')} | {label} | "
+          f"input_chars={input_chars} images={images} timeout={timeout:g}s max_retries=0", flush=True)
+    try:
+        response = operation()
+    except Exception as exc:
+        elapsed = time.monotonic() - started
+        cause = getattr(exc, "__cause__", None)
+        request_id = getattr(exc, "request_id", None)
+        print(f"[API ERROR] {label} elapsed={elapsed:.1f}s type={type(exc).__name__} "
+              f"cause={type(cause).__name__ if cause else '-'} "
+              f"status={getattr(exc, 'status_code', None)} request_id={redact(request_id or '-')} "
+              f"message={redact(exc)}", flush=True)
+        if control.stopped.is_set():
+            raise TaskStopped("当前请求失败；已停止，已有结果保留") from exc
+        raise TaskPaused(f"{label}：{type(exc).__name__}；本批已暂停，未自动重试。查看日志后再继续。") from exc
+    finally:
+        control.finish_api_request()
+    request_id = getattr(response, "_request_id", None) or getattr(response, "id", None)
+    usage = getattr(response, "usage", None)
+    counts = []
+    for name in ("input_tokens", "output_tokens", "total_tokens"):
+        value = getattr(usage, name, None)
+        if isinstance(value, int):
+            counts.append(f"{name}={value}")
+    print(f"[API RESPONSE] {label} elapsed={time.monotonic() - started:.1f}s "
+          f"request_id={redact(request_id or '-')} " + (" ".join(counts) or "usage=unavailable"), flush=True)
+    return response
 
 
 def _anthropic_text(response) -> str:
@@ -240,7 +282,8 @@ def summarize_with_ai(
     if reusable_output(out_path, config, lambda: summary_key(transcript_path, config, visual_analysis_path)):
         print(f"[KEEP] 保留已有学习笔记，不调用 API：{out_path}")
         return True
-    client = _client_from_env(config)
+    timeout = summary_timeout(config)
+    client = _client_from_env(config, timeout=timeout)
     visual_text = ""
     if visual_analysis_path and visual_analysis_path.exists():
         visual_text = visual_analysis_path.read_text(encoding="utf-8", errors="replace")
@@ -257,23 +300,28 @@ def summarize_with_ai(
         model = config.get("model") or ("claude-sonnet-5" if provider == "anthropic" else "gpt-5.6-sol")
         print(f"[AI] Final lecture summary with {provider}:{model} ...")
         if provider == "openai":
-            response = client.responses.create(
+            response = request_ai(lambda: client.responses.create(
                 model=model,
                 input=prompt,
                 max_output_tokens=int(config.get("summary_max_output_tokens", 18000)),
-            )
+            ), label=f"{config['course_code']} · {lecture_date} · 总结", timeout=timeout, input_chars=len(prompt))
             result = checked_ai_text(response, provider)
         else:
-            response = client.messages.create(
+            response = request_ai(lambda: client.messages.create(
                 model=model,
                 max_tokens=int(config.get("summary_max_output_tokens", 18000)),
                 messages=[{"role": "user", "content": prompt}],
-            )
+            ), label=f"{config['course_code']} · {lecture_date} · 总结", timeout=timeout, input_chars=len(prompt))
             result = checked_ai_text(response, provider)
-        CONTROL.check()
         save_cached(out_path, result, summary_key(transcript_path, config, visual_analysis_path))
         print(f"[AI] Saved: {out_path}")
+        CONTROL.check()
         return True
+    except TaskPaused:
+        ai_input = out_path.with_name("AI_INPUT.md")
+        write_auxiliary(ai_input, prompt, config)
+        print(f"[AI] Fallback input saved: {ai_input}")
+        raise
     except Exception as e:
         print(f"[AI] API failed: {redact(e)}")
         ai_input = out_path.with_name("AI_INPUT.md")
@@ -596,11 +644,12 @@ def analyze_video_with_ai(video: Path, vtt: Path, folder: Path, config: dict) ->
             })
         try:
             if provider == "openai":
-                response = client.responses.create(
+                response = request_ai(lambda: client.responses.create(
                     model=model,
                     input=[{"role": "user", "content": content}],
                     max_output_tokens=int(config.get("vision_batch_max_output_tokens", 5000)),
-                )
+                ), label=f"{config.get('course_code', 'COURSE')} · {folder.name} · 画面 {batch_no}/{math.ceil(len(manifest)/batch_size)}",
+                    timeout=120, input_chars=sum(len(x.get('text', '')) for x in content), images=len(batch))
                 txt = checked_ai_text(response, provider)
             else:
                 anth_content = [{
@@ -625,13 +674,13 @@ def analyze_video_with_ai(video: Path, vtt: Path, folder: Path, config: dict) ->
                             "data": base64.b64encode(item["file"].read_bytes()).decode("ascii"),
                         },
                     })
-                response = client.messages.create(
+                response = request_ai(lambda: client.messages.create(
                     model=model,
                     max_tokens=int(config.get("vision_batch_max_output_tokens", 5000)),
                     messages=[{"role": "user", "content": anth_content}],
-                )
+                ), label=f"{config.get('course_code', 'COURSE')} · {folder.name} · 画面 {batch_no}/{math.ceil(len(manifest)/batch_size)}",
+                    timeout=120, input_chars=sum(len(x.get('text', '')) for x in anth_content), images=len(batch))
                 txt = checked_ai_text(response, provider)
-            CONTROL.check()
             atomic_text(part_path, txt)
             part_texts.append(txt)
             print(f"[VIDEO] Analyzed batch {batch_no}/{math.ceil(len(manifest)/batch_size)}")
@@ -645,9 +694,9 @@ def analyze_video_with_ai(video: Path, vtt: Path, folder: Path, config: dict) ->
         "This file is derived from sampled lecture video frames plus nearby VTT context. "
         "It is intended to correct/augment the transcript, especially code, IDE errors, diagrams, and on-screen text.\n\n"
     )
-    CONTROL.check()
     save_cached(out, header + "\n\n---\n\n".join(part_texts), key)
     print(f"[VIDEO] Saved: {out}")
+    CONTROL.check()
     return out
 
 
@@ -1362,9 +1411,9 @@ async def process_one(page: Page, header: Locator, config: dict, out_root: Path)
             mark_status(folder, config, "completed", "complete")
             print(f"[KEEP] {folder.name}：下载已补齐，保留已有分析，不调用 API")
             return True
-        return await asyncio.to_thread(analyze_folder, folder, config)
+        return await CONTROL.run_sync(analyze_folder, folder, config)
     except (TaskStopped, asyncio.CancelledError):
-        mark_status(folder, config, "stopped", "interrupted")
+        mark_interrupted(folder, config)
         raise
     except Exception as exc:
         mark_status(folder, config, "failed", "download", redact(exc))
@@ -1716,6 +1765,13 @@ def mark_status(folder, config, status, stage, error=""):
         atomic_text(folder / "done.json", json.dumps({**record, "complete": False}, ensure_ascii=False, indent=2))
 
 
+def mark_interrupted(folder, config):
+    if lecture_assets_complete(folder, config):
+        mark_status(folder, config, "completed", "complete")
+    else:
+        mark_status(folder, config, "stopped", "interrupted")
+
+
 def analyze_folder(folder, config):
     CONTROL.check()
     work = lecture_work(folder, config)
@@ -1762,7 +1818,10 @@ def analyze_folder(folder, config):
                     "" if ok else "Some selected assets are still missing")
         return ok
     except TaskStopped:
-        mark_status(folder, config, "stopped", "analysis")
+        mark_interrupted(folder, config)
+        raise
+    except TaskPaused as exc:
+        mark_status(folder, config, "paused", "analysis", str(exc))
         raise
     except Exception as exc:
         mark_status(folder, config, "failed", "analysis", redact(exc))
@@ -2036,6 +2095,9 @@ def main():
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
+    except TaskPaused as exc:
+        print(f"[PAUSED] {redact(exc)}")
+        raise SystemExit(2)
     except (KeyboardInterrupt, TaskStopped):
         CONTROL.stop()
         print("[STOPPED] Completed results have been preserved")
